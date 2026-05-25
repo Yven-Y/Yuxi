@@ -1,5 +1,5 @@
 # 开发阶段
-FROM node:20-alpine AS development
+FROM node:22-alpine AS development
 WORKDIR /app
 ENV TZ=Asia/Shanghai
 
@@ -22,7 +22,7 @@ EXPOSE 5173
 # 启动开发服务器的命令在 docker-compose 文件中定义
 
 # 生产阶段
-FROM node:20-alpine AS build-stage
+FROM node:22-alpine AS build-stage
 WORKDIR /app
 
 # 安装 pnpm
