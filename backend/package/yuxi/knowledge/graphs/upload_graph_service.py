@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from yuxi import config
 from yuxi.knowledge.graphs.adapters.base import Neo4jConnectionManager
 from yuxi.models import select_embedding_model
+from yuxi.services.model_cache import is_v2_spec_format
 from yuxi.storage.minio.client import get_minio_client
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
@@ -258,18 +259,25 @@ class UploadGraphService:
         if not self.embed_model_name:
             self.embed_model_name = config.embed_model
 
-        cur_embed_info = config.embed_model_names.get(self.embed_model_name)
-        logger.warning(f"embed_model_name={self.embed_model_name}, {cur_embed_info=}")
+        # 获取嵌入模型维度（支持 V1 和 V2 格式）
+        if is_v2_spec_format(self.embed_model_name):
+            from yuxi.services.model_cache import model_cache
 
-        # 允许 self.embed_model_name 与 config.embed_model 不同（用户自定义选择的情况）
-        # 但必须在支持的模型列表中
-        assert self.embed_model_name in config.embed_model_names, f"Unsupported embed model: {self.embed_model_name}"
+            cur_embed_info = model_cache.get_model_info(self.embed_model_name)
+            if not cur_embed_info:
+                raise ValueError(f"Unsupported embed model: {self.embed_model_name}")
+            dimension = cur_embed_info.dimension or 1024
+        else:
+            cur_embed_info = config.embed_model_names.get(self.embed_model_name)
+            assert cur_embed_info is not None, f"Unsupported embed model: {self.embed_model_name}"
+            dimension = cur_embed_info.dimension or 1024
+        logger.warning(f"embed_model_name={self.embed_model_name}, dimension={dimension}")
 
         with self.driver.session() as session:
             logger.info(f"Adding entity to {kgdb_name}")
             session.execute_write(_create_graph, triples)
             logger.info(f"Creating vector index for {kgdb_name} with {config.embed_model}")
-            session.execute_write(_create_vector_index, getattr(cur_embed_info, "dimension", 1024))
+            session.execute_write(_create_vector_index, dimension)
 
             # 收集所有需要处理的实体名称，去重
             all_entities = set()
