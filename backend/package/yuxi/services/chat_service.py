@@ -730,9 +730,22 @@ async def stream_agent_chat(
     current_user,
     db,
 ) -> AsyncIterator[bytes]:
+    """流式智能体对话主入口。
+
+    整体流程：
+    1. 前置检查（content_guard + 部门绑定）
+    2. 解析 agent_config → 提取 agent_id + context（含 knowledges 等）
+    3. 构建 LangGraph input_context 并流式执行 Agent
+    4. stream 完成后保存消息到 DB，返回 finished
+    5. 异常时保存部分消息，返回 interrupted/error
+
+    返回格式为 NDJSON（每行一个 JSON），status 枚举：
+    - init / loading / agent_state / finished / interrupted / error
+    """
     start_time = asyncio.get_event_loop().time()
 
     def make_chunk(content=None, **kwargs):
+        """构造一行 NDJSON，统一注入 request_id"""
         return (
             json.dumps(
                 {"request_id": meta.get("request_id"), "response": content, **kwargs}, ensure_ascii=False
@@ -740,6 +753,7 @@ async def stream_agent_chat(
             + b"\n"
         )
 
+    # --- 1. 构建 HumanMessage（纯文本 or 多模态图片）---
     if image_content:
         human_message = HumanMessage(
             content=[
@@ -752,6 +766,7 @@ async def stream_agent_chat(
         human_message = HumanMessage(content=query)
         message_type = "text"
 
+    # --- 2. 发送 init chunk（通知前端连接已建立）---
     init_msg = {"role": "user", "content": query, "type": "human"}
     if image_content:
         init_msg["message_type"] = "multimodal_image"
@@ -761,6 +776,7 @@ async def stream_agent_chat(
 
     yield make_chunk(status="init", meta=meta, msg=init_msg)
 
+    # --- 3. 前置校验：content_guard + 部门绑定 ---
     if conf.enable_content_guard and await content_guard.check(query):
         yield make_chunk(
             status="error", error_type="content_guard_blocked", error_message="输入内容包含敏感词", meta=meta
@@ -771,11 +787,13 @@ async def stream_agent_chat(
         yield make_chunk(status="error", error_type="invalid_config", error_message="当前用户未绑定部门", meta=meta)
         return
 
+    # --- 4. 补齐 request_id ---
     meta = dict(meta or {})
     if "request_id" not in meta or not meta.get("request_id"):
         logger.warning("请求缺少 request_id，已自动生成一个新的 request_id")
         meta["request_id"] = str(uuid.uuid4())
 
+    # --- 5. 解析 agent_config：根据 agent_config_id 查库，提取 agent_id 和运行时 context ---
     user_id = str(current_user.id)
     try:
         config_item = await get_agent_config_by_id(db, current_user, agent_config_id)
@@ -795,6 +813,7 @@ async def stream_agent_chat(
         }
     )
 
+    # --- 6. 获取 Agent 实例 ---
     try:
         agent = agent_manager.get_agent(agent_id)
     except Exception as e:
@@ -808,12 +827,16 @@ async def stream_agent_chat(
         return
 
     messages = [human_message]
+    # agent_config 即 config_json.context，包含 knowledges/model/tools/system_prompt 等
     agent_config = (config_item.config_json or {}).get("context", {})
 
+    # --- 7. 生成 thread_id（前端未传则自动创建）---
     if not thread_id:
         thread_id = str(uuid.uuid4())
         logger.warning(f"No thread_id provided, generated new thread_id: {thread_id}")
 
+    # --- 8. 构建 LangGraph 输入上下文 + Langfuse 追踪 ---
+    # input_context 会将 knowledges 等配置注入到 BaseContext，后续由 KnowledgeBaseMiddleware 解析
     input_context = await _build_agent_input_context(agent_config, thread_id=thread_id, user_id=user_id)
     langfuse_run = _build_langfuse_run_context(
         current_user=current_user,
@@ -825,11 +848,12 @@ async def stream_agent_chat(
         message_type=message_type,
     )
     full_msg = None
-    accumulated_content: list[str] = []
+    accumulated_content: list[str] = []    # 累积 AIMessageChunk 文本，用于流式 content_guard 终检
     trace_info: dict[str, Any] = {}
     last_agent_state_signature = ""
 
     try:
+        # --- 9. 确保 thread 绑定 agent_config + 保存用户消息到 DB ---
         conv_repo = ConversationRepository(db)
         agent_config_repo = AgentConfigRepository(db)
         await _ensure_thread_bound_agent_config(
@@ -857,23 +881,27 @@ async def stream_agent_chat(
         except Exception as e:
             logger.error(f"Error saving user message: {e}")
 
-        # 先构建 langgraph_config
+        # LangGraph 会自动从 checkpointer 恢复 state（包括 uploads），无需手动加载或传递
         langgraph_config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
 
-        # LangGraph 会自动从 checkpointer 恢复 state（包括 uploads）
-        # 无需手动加载或传递
-
+        # --- 10. 核心：流式执行 LangGraph Agent ---
+        # _stream_agent_events 内部调用 agent.stream_messages_with_state()
+        # → BaseAgent.stream_messages_with_state() → graph.astream(stream_mode=["messages", "values"])
+        # 同时输出两种模式:
+        #   - mode="messages": 每条模型/tool 消息 (AIMessageChunk, ToolMessage 等)
+        #   - mode="values":   state 快照，用于推送 agent_state（todos/files/artifacts）
         full_msg = None
         accumulated_content = []
         async for mode, payload in _stream_agent_events(
             agent,
             messages,
-            input_context=input_context,
+            input_context=input_context,   # 携带 knowledges/model/system_prompt 等
             callbacks=langfuse_run.callbacks,
             metadata=langfuse_run.metadata,
             tags=langfuse_run.tags,
         ):
             if mode == "values":
+                # agent_state 变化时推送给前端（todo 更新、文件变化等）
                 agent_state = extract_agent_state(payload if isinstance(payload, dict) else {})
                 signature = _agent_state_signature(agent_state)
                 if signature and signature != last_agent_state_signature:
@@ -886,6 +914,7 @@ async def stream_agent_chat(
                 accumulated_content.append(msg.content)
                 trace_info = get_trace_info(langfuse_run)
 
+                # 流式 content_guard：对累计内容的最后 10 个 chunk 做关键词检测
                 content_for_check = "".join(accumulated_content[-10:])
                 if conf.enable_content_guard and await content_guard.check_with_keywords(content_for_check):
                     full_msg = AIMessage(content="".join(accumulated_content))
@@ -902,13 +931,16 @@ async def stream_agent_chat(
 
                 yield make_chunk(content=msg.content, msg=msg.model_dump(), metadata=metadata, status="loading")
             else:
+                # ToolMessage 等非文本消息：透传原始数据
                 msg_dict = msg.model_dump()
                 trace_info = get_trace_info(langfuse_run)
                 yield make_chunk(msg=msg_dict, metadata=metadata, status="loading")
 
+        # --- 11. stream 完成后的终检与后处理 ---
         full_msg = _ensure_full_msg(full_msg, accumulated_content)
         trace_info = get_trace_info(langfuse_run)
 
+        # 11a. content_guard 终检：对完整输出做敏感词检测
         if conf.enable_content_guard and hasattr(full_msg, "content") and await content_guard.check(full_msg.content):
             await save_partial_message(
                 conv_repo,
@@ -921,9 +953,11 @@ async def stream_agent_chat(
             yield make_chunk(status="interrupted", message="检测到敏感内容，已中断输出", meta=meta)
             return
 
+        # 11b. 检查 LangGraph interrupt（人工审批、问询等）
         async for chunk in check_and_handle_interrupts(agent, langgraph_config, make_chunk, meta, thread_id):
             yield chunk
 
+        # 11c. 提取最终 agent_state
         meta["time_cost"] = asyncio.get_event_loop().time() - start_time
         try:
             graph = await agent.get_graph()
@@ -937,7 +971,7 @@ async def stream_agent_chat(
             last_agent_state_signature = final_signature
             yield make_chunk(status="agent_state", agent_state=agent_state, meta=meta)
 
-        # 先存储数据库，再返回 finished，避免前端查询时数据未落库
+        # 11d. 先存储数据库，再返回 finished，避免前端查询时数据未落库
         try:
             await save_messages_from_langgraph_state(
                 agent_instance=agent,
@@ -953,10 +987,12 @@ async def stream_agent_chat(
 
         yield make_chunk(status="finished", meta=meta)
 
+    # --- 12. 异常处理：客户端断开 ---
     except (asyncio.CancelledError, ConnectionError) as e:
         logger.warning(f"Client disconnected, cancelling stream: {e}")
 
         async def save_cleanup():
+            """新的 DB session 中保存已累积的部分消息，避免原 session 已被取消"""
             nonlocal full_msg
             full_msg = _ensure_full_msg(full_msg, accumulated_content)
 
@@ -973,7 +1009,7 @@ async def stream_agent_chat(
 
         cleanup_task = asyncio.create_task(save_cleanup())
         try:
-            await asyncio.shield(cleanup_task)
+            await asyncio.shield(cleanup_task)   # 保护清理任务不被父协程取消
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -981,6 +1017,7 @@ async def stream_agent_chat(
 
         yield make_chunk(status="interrupted", message="对话已中断", meta=meta)
 
+    # --- 13. 异常处理：运行时错误 ---
     except Exception as e:
         logger.error(f"Error streaming messages: {e}, {traceback.format_exc()}")
 
